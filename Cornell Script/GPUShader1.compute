@@ -1,0 +1,139 @@
+#pragma kernel CHKernel
+
+struct DistanceData
+{
+	float _distance;
+};
+
+Texture2D<float4> image;
+RWStructuredBuffer<DistanceData> distanceBuffer;
+groupshared float shareMem[1024];
+
+int WIDTH;
+int HEIGHT;
+
+float arc1;
+float arc2;
+float offset;
+float _alpha;
+
+float AdjustAngle(float angle);
+float Distance2Angle(float arc, float border);
+float GetMin(float a, float b);
+float GetMin(float a, float b, float c, float d);
+float3 RGBtoHSV(in float3 RGB);
+
+[numthreads(32, 32, 1)]
+void CHKernel(uint3 Gid : SV_GroupID, uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint GI : SV_GroupIndex)
+{
+	//calculate border and centre
+	float border1 = _alpha;
+	float border2 = AdjustAngle(border1 + arc1);
+	float centre1 = AdjustAngle(border1 + arc1 / 2);
+
+	uint Idx = DTid.x + DTid.y * WIDTH;//pixel index
+	float4 color = image[uint2(Idx / HEIGHT, Idx % HEIGHT)];//get color information
+	float3 rgb = float3(color.xyz);//transfer RGB to HSV
+	float3 hsv = RGBtoHSV(rgb);
+
+	float _distance = 0.0f;
+	float h = hsv.x;
+	float s = hsv.y;
+	float arc = h * 360;//reflect hue to circle angle
+	float d2c1 = Distance2Angle(arc, centre1);//distance to sector centre
+
+
+	if (arc2 != 0)//template has two sectors
+	{
+		float border3 = AdjustAngle(centre1 + offset - arc2 / 2);
+		float border4 = AdjustAngle(border3 + arc2);
+		float centre2 = AdjustAngle(border3 + arc2 / 2);
+
+		float d2c2 = Distance2Angle(arc, centre2);
+
+		if (d2c1 <= arc1 / 2 || d2c2 <= arc2 / 2) _distance = 0;//arc is in the template
+		else
+		{
+			float d2b1 = Distance2Angle(arc, border1);//distance to border1,2,3,4
+			float d2b2 = Distance2Angle(arc, border2);
+			float d2b3 = Distance2Angle(arc, border3);
+			float d2b4 = Distance2Angle(arc, border4);
+			_distance = GetMin(d2b1, d2b2, d2b3, d2b4) * s;//calculate the shortest distance
+		}
+
+	}
+	else //template has one sector
+	{
+		if (d2c1 <= arc1 / 2) _distance = 0;//arc is in the template
+		else
+		{
+			float d2b1 = Distance2Angle(arc, border1);//distance to border1,2
+			float d2b2 = Distance2Angle(arc, border2);
+			float d2c1 = Distance2Angle(arc, centre1);//distance to sector centre
+			_distance = GetMin(d2b1, d2b2) * s;//calculate the shortest distance
+		}
+	}
+	//write data to shared memory
+	shareMem[GI] = _distance;
+	GroupMemoryBarrierWithGroupSync();
+
+	//Accumulate data
+	[unroll]
+	for (uint stride = 1; stride < 1024; stride *= 2)
+	{
+		int index = 2 * stride * GI;
+		if (index < 1024)
+			shareMem[index] += shareMem[index + stride];
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (GI == 0)
+	{
+		uint i = Gid.x + Gid.y * 16;
+		//uint i = Gid.x + Gid.y * 16;
+		distanceBuffer[i]._distance = shareMem[0];
+	}
+
+}
+
+//make angle in [0,360]
+float AdjustAngle(float angle)
+{
+	angle = angle > 360 ? angle - 360 : angle;
+	angle = angle < 0 ? 360 + angle : angle;
+	return angle;
+}
+
+//calculate the distance to a angle(like border or centre) and keep it not over 180 degrees
+float Distance2Angle(float arc, float border)
+{
+	float _distance = AdjustAngle(arc - border);
+	float _distance2 = 360 - _distance;
+	return GetMin(_distance, _distance2);
+}
+
+//get minimum in several float numbers
+float GetMin(float a, float b)
+{
+	return a < b ? a : b;
+}
+float GetMin(float a, float b, float c, float d)
+{
+	a = a < b ? a : b;
+	a = a < c ? a : c;
+	a = a < d ? a : d;
+	return a;
+}
+
+//HLSL doesn't contain the function that can transfer RGB to HSV
+float3 RGBtoHSV(in float3 RGB)
+{
+	float Epsilon = 1e-10;
+	// Based on work by Sam Hocevar and Emil Persson
+	float4 P = (RGB.g < RGB.b) ? float4(RGB.bg, -1.0, 2.0 / 3.0) : float4(RGB.gb, 0.0, -1.0 / 3.0);
+	float4 Q = (RGB.r < P.x) ? float4(P.xyw, RGB.r) : float4(RGB.r, P.yzx);
+	float C = Q.x - min(Q.w, Q.y);
+	float H = abs((Q.w - Q.y) / (6 * C + Epsilon) + Q.z);
+	float S = C / (Q.x + Epsilon);
+	return float3(H, S, Q.x);
+}
